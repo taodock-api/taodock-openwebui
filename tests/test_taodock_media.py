@@ -1,7 +1,6 @@
 """Unit tests for the Taodock Media Open WebUI tool.
 
-All HTTP traffic is mocked through a fake httpx.Client injected via
-Tools._client, so tests run without network access or an API key.
+HTTPX mock transports exercise async requests without network access or a real key.
 """
 
 from __future__ import annotations
@@ -9,51 +8,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import unittest
-from typing import Any, Optional
+from typing import Any
+
+import httpx
 
 import taodock_media
 from taodock_media import Tools, _TaodockError
 
 
-class FakeResponse:
-    def __init__(
-        self,
-        status_code: int = 200,
-        json_body: Any = None,
-        content: bytes = b"",
-        content_type: str = "application/json",
-    ) -> None:
-        self.status_code = status_code
-        self._json = json_body
-        self.content = content
-        self.text = json_body if isinstance(json_body, str) else (str(json_body) if json_body is not None else "")
-        self.headers = {"content-type": content_type}
-
-    def json(self) -> Any:
-        return self._json
-
-
-class FakeClient:
-    def __init__(self, responses: dict[tuple[str, str], FakeResponse]) -> None:
-        self.responses = responses
-        self.calls: list[tuple[str, str, Optional[dict]]] = []
-
-    def request(self, method: str, path: str, json: Optional[dict] = None) -> FakeResponse:
-        self.calls.append((method, path, json))
-        key = (method.upper(), path)
-        if key not in self.responses:
-            raise AssertionError(f"Unexpected call: {method} {path}")
-        return self.responses[key]
-
-    def __enter__(self) -> "FakeClient":
-        return self
-
-    def __exit__(self, *args: Any) -> None:
-        return None
-
-
 def make_tools(
-    responses: dict[tuple[str, str], FakeResponse],
+    responses: dict[tuple[str, str], httpx.Response],
     *,
     api_key: str = "sk-test",
     default_image_model: str = "",
@@ -63,9 +27,20 @@ def make_tools(
     tools.valves.api_key = api_key
     tools.valves.default_image_model = default_image_model
     tools.valves.default_video_model = default_video_model
-    fake = FakeClient(responses)
-    tools._fake_client = fake  # type: ignore[attr-defined]
-    tools._client = lambda _key: fake  # type: ignore[method-assign]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        path = request.url.raw_path.decode("ascii")
+        assert path.startswith("/v1/"), f"API request lost its /v1 prefix: {path}"
+        return responses[(request.method, path.removeprefix("/v1/"))]
+
+    def client(key: str) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url="https://taodock.com/v1",
+            headers={"Authorization": f"Bearer {key}"},
+            transport=httpx.MockTransport(respond),
+        )
+
+    tools._client = client  # type: ignore[method-assign]
     return tools
 
 
@@ -76,14 +51,14 @@ def run(coro: Any) -> str:
 class TestListModels(unittest.TestCase):
     def test_lists_model_ids(self) -> None:
         tools = make_tools(
-            {("GET", "models"): FakeResponse(json_body={"data": [{"id": "agnes-3.0-flash"}, {"id": "agnes-image-2.5-flash"}]})}
+            {("GET", "models"): httpx.Response(200, json={"data": [{"id": "chat-model"}, {"id": "image-model"}]})}
         )
         out = run(tools.list_models())
-        self.assertIn("agnes-3.0-flash", out)
-        self.assertIn("agnes-image-2.5-flash", out)
+        self.assertIn("chat-model", out)
+        self.assertIn("image-model", out)
 
     def test_empty_model_list(self) -> None:
-        tools = make_tools({("GET", "models"): FakeResponse(json_body={"data": []})})
+        tools = make_tools({("GET", "models"): httpx.Response(200, json={"data": []})})
         self.assertIn("No models", run(tools.list_models()))
 
     def test_missing_api_key(self) -> None:
@@ -95,8 +70,8 @@ class TestGenerateImage(unittest.TestCase):
     def test_inline_image_markdown(self) -> None:
         tools = make_tools(
             {
-                ("POST", "images/generations"): FakeResponse(
-                    json_body={"data": [{"b64_json": base64.b64encode(b"png-bytes").decode()}]}
+                ("POST", "images/generations"): httpx.Response(
+                    200, json={"data": [{"b64_json": base64.b64encode(b"png-bytes").decode()}]}
                 )
             },
             default_image_model="agnes-image-2.5-flash",
@@ -106,19 +81,20 @@ class TestGenerateImage(unittest.TestCase):
 
     def test_url_image_markdown(self) -> None:
         tools = make_tools(
-            {("POST", "images/generations"): FakeResponse(json_body={"data": [{"url": "https://cdn.example.com/a.png"}]})},
+            {("POST", "images/generations"): httpx.Response(200, json={"data": [{"url": "https://cdn.example.com/a.png"}]})},
             default_image_model="agnes-image-2.5-flash",
         )
         out = run(tools.generate_image("a red fox"))
         self.assertIn("https://cdn.example.com/a.png", out)
 
-    def test_api_error_raises_taodock_error(self) -> None:
+    def test_api_error_has_status_and_omits_server_details(self) -> None:
         tools = make_tools(
-            {("POST", "images/generations"): FakeResponse(status_code=503, json_body={"error": "model_not_found"})},
+            {("POST", "images/generations"): httpx.Response(503, json={"error": "private upstream details"})},
             default_image_model="agnes-image-2.5-flash",
         )
-        with self.assertRaises(_TaodockError):
+        with self.assertRaisesRegex(_TaodockError, "HTTP 503") as error:
             run(tools.generate_image("a red fox"))
+        self.assertNotIn("private upstream details", str(error.exception))
 
     def test_requires_model(self) -> None:
         tools = make_tools({})
@@ -129,7 +105,7 @@ class TestGenerateImage(unittest.TestCase):
 class TestVideoFlow(unittest.TestCase):
     def test_create_video_returns_task_id(self) -> None:
         tools = make_tools(
-            {("POST", "videos"): FakeResponse(json_body={"id": "task_123", "status": "queued"})},
+            {("POST", "videos"): httpx.Response(200, json={"id": "task_123", "status": "queued"})},
             default_video_model="agnes-video-2.5",
         )
         out = run(tools.create_video("a red fox runs"))
@@ -137,7 +113,7 @@ class TestVideoFlow(unittest.TestCase):
 
     def test_get_video_status_completed(self) -> None:
         tools = make_tools(
-            {("GET", "videos/task_123"): FakeResponse(json_body={"id": "task_123", "status": "completed"})}
+            {("GET", "videos/task_123"): httpx.Response(200, json={"id": "task_123", "status": "completed"})}
         )
         out = run(tools.get_video_status("task_123"))
         self.assertIn("completed", out)
@@ -145,7 +121,7 @@ class TestVideoFlow(unittest.TestCase):
 
     def test_download_video_requires_completion(self) -> None:
         tools = make_tools(
-            {("GET", "videos/task_123"): FakeResponse(json_body={"id": "task_123", "status": "in_progress"})}
+            {("GET", "videos/task_123"): httpx.Response(200, json={"id": "task_123", "status": "in_progress"})}
         )
         out = run(tools.download_video("task_123"))
         self.assertIn("not completed", out)
@@ -154,9 +130,9 @@ class TestVideoFlow(unittest.TestCase):
         mp4 = b"\x00\x00\x00\x18ftypmp42fake-video"
         tools = make_tools(
             {
-                ("GET", "videos/task_123"): FakeResponse(json_body={"id": "task_123", "status": "completed"}),
-                ("GET", "videos/task_123/content"): FakeResponse(
-                    json_body=None, content=mp4, content_type="video/mp4"
+                ("GET", "videos/task_123"): httpx.Response(200, json={"id": "task_123", "status": "completed"}),
+                ("GET", "videos/task_123/content"): httpx.Response(
+                    200, content=mp4, headers={"Content-Type": "video/mp4"},
                 ),
             }
         )
@@ -164,14 +140,56 @@ class TestVideoFlow(unittest.TestCase):
         self.assertIn("data:video/mp4;base64,", out)
         self.assertIn(base64.b64encode(mp4).decode(), out)
 
+    def test_download_limits_stream_without_content_length(self) -> None:
+        class AsyncChunks(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b"a" * taodock_media._MAX_INLINE_VIDEO_BYTES
+                yield b"b"
+
+        tools = make_tools(
+            {
+                ("GET", "videos/task_123"): httpx.Response(200, json={"status": "completed"}),
+                ("GET", "videos/task_123/content"): httpx.Response(
+                    200, stream=AsyncChunks(), headers={"Content-Type": "video/mp4"},
+                ),
+            }
+        )
+        with self.assertRaisesRegex(_TaodockError, "10 MiB"):
+            run(tools.download_video("task_123"))
+
+    def test_download_rejects_a_json_response(self) -> None:
+        tools = make_tools(
+            {
+                ("GET", "videos/task_123"): httpx.Response(200, json={"status": "completed"}),
+                ("GET", "videos/task_123/content"): httpx.Response(200, json={"data": "not a video"}),
+            }
+        )
+        with self.assertRaisesRegex(_TaodockError, "did not return an MP4"):
+            run(tools.download_video("task_123"))
+
+    def test_task_id_cannot_change_the_api_route(self) -> None:
+        tools = make_tools({("GET", "videos/task%3Fpart"): httpx.Response(200, json={"status": "queued"})})
+        self.assertIn("queued", run(tools.get_video_status("task?part")))
+        with self.assertRaisesRegex(_TaodockError, "task ID returned"):
+            run(tools.get_video_status("../models"))
+
 
 class TestUserValves(unittest.TestCase):
     def test_user_key_overrides_shared_key(self) -> None:
-        tools = make_tools({("GET", "models"): FakeResponse(json_body={"data": []})})
+        tools = make_tools({("GET", "models"): httpx.Response(200, json={"data": []})})
         user_valves = tools.UserValves(api_key="sk-user-personal")
         run(tools.list_models(__user__={"valves": user_valves}))
-        # The fake client was created with the user key, proving the override path ran.
         self.assertEqual(tools._api_key({"valves": user_valves}), "sk-user-personal")
+        self.assertEqual(tools._api_key({"valves": tools.UserValves(api_key=" ")}), "sk-test")
+
+    def test_requires_https_and_masks_key_fields(self) -> None:
+        tools = Tools()
+        tools.valves.api_key = "dummy-key"
+        tools.valves.base_url = "http://example.com/v1"
+        with self.assertRaisesRegex(_TaodockError, "trusted HTTPS"):
+            run(tools.list_models())
+        for valve_type in (Tools.Valves, Tools.UserValves):
+            self.assertEqual(valve_type.model_json_schema()["properties"]["api_key"]["input"]["type"], "password")
 
 
 class TestMetadata(unittest.TestCase):
