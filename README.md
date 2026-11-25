@@ -14,6 +14,10 @@ An Open WebUI Tool for generating images and managing asynchronous Taodock video
 
 ## Install
 
+Sign in to Open WebUI Community, choose **Add to Open WebUI**, and enter the URL of your instance to import the Tool. The same dialog offers a JSON download. [Taodock Media on Open WebUI Community](https://openwebui.com/posts/taodock_media_image_and_video_generation_24bc8109)
+
+To install from Python source:
+
 1. Download `taodock_media.py` from the [latest release](https://github.com/taodock-api/taodock-openwebui/releases/latest), or open the [source file](taodock_media.py) in this repository.
 2. In Open WebUI, go to **Workspace → Tools → + (Create)**. Paste the full source and save. Your workspace role needs permission to create Tools.
 3. Open the tool's **Valves** and set:
